@@ -1,116 +1,117 @@
 //! Text functionality for Piet cairo backend
 
-mod grapheme;
-mod lines;
+//mod grapheme;
+//mod lines;
 
+use std::convert::TryInto;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use cairo::{FontFace, FontOptions, FontSlant, FontWeight, Matrix, ScaledFont};
+use cairo::{Matrix, ScaledFont};
+use pango::{FontFamilyExt as _, FontMapExt as _};
 
 use piet::kurbo::{Point, Rect, Size};
 use piet::{
     util, Color, Error, FontFamily, FontStyle, HitTestPoint, HitTestPosition, LineMetric, Text,
-    TextAttribute, TextLayout, TextLayoutBuilder,
+    TextAlignment, TextAttribute, TextLayout, TextLayoutBuilder,
 };
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use self::grapheme::{get_grapheme_boundaries, point_x_in_grapheme};
+//use self::grapheme::{get_grapheme_boundaries, point_x_in_grapheme};
 
 /// Right now, we don't need any state, as the "toy text API" treats the
 /// access to system font information as a global. This will change.
 // we use a phantom lifetime here to match the API of the d2d backend,
 // and the likely API of something with access to system font information.
 #[derive(Clone)]
-pub struct CairoText;
-
-#[derive(Clone)]
-struct CairoFont {
-    family: FontFamily,
+pub struct PangoText {
+    font_map: pango::FontMap,
+    // Arc to allow non-borrow sharing with layout builder. We could use glib reference counting,
+    // but I'm being rust-y.
+    ctx: Arc<pango::Context>,
 }
 
 #[derive(Clone)]
-pub struct CairoTextLayout {
-    // we currently don't handle range attributes, so we stash the default
-    // color here and then just grab it when we draw ourselves.
-    pub(crate) fg_color: Color,
-    size: Size,
-    pub(crate) font: ScaledFont,
-    pub(crate) text: Arc<str>,
-
-    // currently calculated on build
-    pub(crate) line_metrics: Vec<LineMetric>,
+pub struct PangoTextLayout {
+    pub(crate) layout: pango::Layout,
+    text: Arc<str>,
 }
 
-pub struct CairoTextLayoutBuilder {
+pub struct PangoTextLayoutBuilder {
     text: Arc<str>,
     defaults: util::LayoutDefaults,
+    alignment: TextAlignment,
     width_constraint: f64,
+    ctx: Arc<pango::Context>,
 }
 
-impl CairoText {
+impl PangoText {
     /// Create a new factory that satisfies the piet `Text` trait.
-    ///
-    /// No state is needed for now because the current implementation is just
-    /// toy text, but that will change when proper text is implemented.
     #[allow(clippy::new_without_default)]
-    pub fn new() -> CairoText {
-        CairoText
+    pub fn new() -> PangoText {
+        let font_map = pangocairo::FontMap::get_default().expect("could not get default font map");
+        let ctx = Arc::new(
+            pango::FontMapExt::create_context(&font_map).expect("could not create pango context"),
+        );
+        PangoText { font_map, ctx }
     }
 }
 
-impl Text for CairoText {
-    type TextLayout = CairoTextLayout;
-    type TextLayoutBuilder = CairoTextLayoutBuilder;
+impl Text for PangoText {
+    type TextLayout = PangoTextLayout;
+    type TextLayoutBuilder = PangoTextLayoutBuilder;
 
     fn font_family(&mut self, family_name: &str) -> Option<FontFamily> {
-        Some(FontFamily::new_unchecked(family_name))
+        // Pango doesn't really care about font families - it decides whether a font exists or not
+        // once it has all information, inc. weight, size, etc. Here, we just check that *a* font
+        // exists with the given family (a.k.a. face).
+        if self
+            .font_map
+            .list_families() // allocates
+            .into_iter()
+            .filter(|fam| {
+                fam.get_name()
+                    .map(|name| name == family_name)
+                    .unwrap_or(false)
+            })
+            .next()
+            .is_some()
+        {
+            Some(FontFamily::new_unchecked(family_name))
+        } else {
+            None
+        }
     }
 
     fn load_font(&mut self, _data: &[u8]) -> Result<FontFamily, Error> {
+        // For pango, you have to have the font in a file and tell fontconfig where it is, if you
+        // want to load custom fonts.
         Err(Error::NotSupported)
     }
 
     fn new_text_layout(&mut self, text: impl Into<Arc<str>>) -> Self::TextLayoutBuilder {
-        CairoTextLayoutBuilder {
+        PangoTextLayoutBuilder {
             defaults: util::LayoutDefaults::default(),
             text: text.into(),
             width_constraint: f64::INFINITY,
+            // TODO this choice is somewhat arbitary.
+            alignment: TextAlignment::Start,
+            ctx: self.ctx.clone(),
         }
     }
 }
 
-impl CairoFont {
-    pub(crate) fn new(family: FontFamily) -> Self {
-        CairoFont { family }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resolve_simple(&self, size: f64) -> ScaledFont {
-        self.resolve(size, FontSlant::Normal, FontWeight::Normal)
-    }
-
-    /// Create a ScaledFont for this family.
-    pub(crate) fn resolve(&self, size: f64, slant: FontSlant, weight: FontWeight) -> ScaledFont {
-        let font_face = FontFace::toy_create(self.family.name(), slant, weight);
-        let font_matrix = scale_matrix(size);
-        let ctm = scale_matrix(1.0);
-        let options = FontOptions::default();
-        ScaledFont::new(&font_face, &font_matrix, &ctm, &options)
-    }
-}
-
-impl TextLayoutBuilder for CairoTextLayoutBuilder {
-    type Out = CairoTextLayout;
+impl TextLayoutBuilder for PangoTextLayoutBuilder {
+    type Out = PangoTextLayout;
 
     fn max_width(mut self, width: f64) -> Self {
         self.width_constraint = width;
         self
     }
 
-    fn alignment(self, _alignment: piet::TextAlignment) -> Self {
-        eprintln!("TextAlignment not supported by cairo toy text");
+    fn alignment(mut self, alignment: TextAlignment) -> Self {
+        self.alignment = alignment;
         self
     }
 
@@ -121,34 +122,40 @@ impl TextLayoutBuilder for CairoTextLayoutBuilder {
 
     fn range_attribute(
         self,
-        _range: impl RangeBounds<usize>,
-        _attribute: impl Into<TextAttribute>,
+        range: impl RangeBounds<usize>,
+        attribute: impl Into<TextAttribute>,
     ) -> Self {
         self
     }
 
     fn build(self) -> Result<Self::Out, Error> {
-        // set our default font
-        let font = CairoFont::new(self.defaults.font.clone());
-        let size = self.defaults.font_size;
-        let weight = if self.defaults.weight.to_raw() <= piet::FontWeight::MEDIUM.to_raw() {
-            FontWeight::Normal
-        } else {
-            FontWeight::Bold
-        };
-        let slant = match self.defaults.style {
-            FontStyle::Italic => FontSlant::Italic,
-            FontStyle::Regular => FontSlant::Normal,
-        };
+        // build font description
+        let mut desc = pango::FontDescription::new();
+        desc.set_family(self.defaults.font.name());
+        // TODO is this right - not set_size?
+        desc.set_absolute_size(self.defaults.font_size);
+        // TODO align
+        // TODO weight
+        desc.set_style(match self.defaults.style {
+            FontStyle::Regular => pango::Style::Normal,
+            FontStyle::Italic => pango::Style::Italic,
+        });
 
-        let scaled_font = font.resolve(size, slant, weight);
-
-        // invalid until update_width() is called
-        let mut layout = CairoTextLayout {
-            fg_color: self.defaults.fg_color,
-            font: scaled_font,
-            size: Size::ZERO,
-            line_metrics: Vec::new(),
+        // build text layout
+        let layout = pango::Layout::new(&self.ctx);
+        layout.set_font_description(Some(&desc));
+        // Justification is separate from align in pango.
+        if let TextAlignment::Justified = self.alignment {
+            layout.set_justify(true);
+        }
+        // in pango, RTL means `Left` and `Right` swap meanings.
+        layout.set_alignment(match self.alignment {
+            TextAlignment::Start | TextAlignment::Justified => pango::Alignment::Left,
+            TextAlignment::Center => pango::Alignment::Center,
+            TextAlignment::End => pango::Alignment::Right,
+        });
+        let mut layout = PangoTextLayout {
+            layout,
             text: self.text,
         };
 
@@ -157,13 +164,53 @@ impl TextLayoutBuilder for CairoTextLayoutBuilder {
     }
 }
 
-impl TextLayout for CairoTextLayout {
+impl PangoTextLayout {
+    /// A helper method to create a run iterator for the current layout, and then move it to the
+    /// line number given. If the line doesn't exist, `None` is returned.
+    fn iter_at_line_number(&self, line_number: usize) -> Option<pango::LayoutIter> {
+        let mut iter = self.layout.get_iter()?;
+        for _ in 0..line_number {
+            if iter.at_last_line() {
+                return None;
+            }
+            iter.next_line();
+        }
+        Some(iter)
+    }
+
+    /// Get the text from the line that `iter` is currently on. Returns indexes into text string
+    /// (start, end).
+    fn iter_line_text(&self, iter: &mut pango::LayoutIter) -> (usize, usize) {
+        let start = iter
+            .get_index()
+            .try_into()
+            .expect("LayoutIter::get_index: i32 -> usize conv failed");
+        let end = if iter.at_last_line() {
+            self.text.len()
+        } else {
+            iter.next_line();
+            iter.get_index()
+                .try_into()
+                .expect("LayoutIter::get_index: i32 -> usize conv failed")
+        };
+        (start, end)
+    }
+}
+
+// In pango, "logical" bounds are what you use for positioning, "ink" bounds are where there will
+// actually be drawing (e.g. for marking dirty areas).
+impl TextLayout for PangoTextLayout {
     fn size(&self) -> Size {
-        self.size
+        self.image_bounds().size()
     }
 
     fn image_bounds(&self) -> Rect {
-        self.size.to_rect()
+        let r = self.layout.get_extents().1;
+        let x0 = pango::units_to_double(r.x);
+        let y0 = pango::units_to_double(r.y);
+        let x1 = x0 + pango::units_to_double(r.width);
+        let y1 = y0 + pango::units_to_double(r.height);
+        Rect::new(x0, y0, x1, y1)
     }
 
     fn text(&self) -> &str {
@@ -171,216 +218,106 @@ impl TextLayout for CairoTextLayout {
     }
 
     fn update_width(&mut self, new_width: impl Into<Option<f64>>) -> Result<(), Error> {
-        let new_width = new_width.into().unwrap_or(std::f64::INFINITY);
-
-        self.line_metrics = lines::calculate_line_metrics(&self.text, &self.font, new_width);
-
-        let width = self
-            .line_metrics
-            .iter()
-            .map(|lm| self.font.text_extents(&self.text[lm.range()]).x_advance)
-            .fold(0.0, |a: f64, b| a.max(b));
-
-        let height = self
-            .line_metrics
-            .last()
-            .map(|l| l.y_offset + l.height)
-            .unwrap_or_else(|| self.font.extents().height);
-        self.size = Size::new(width, height);
-
+        // TODO no idea if this conversion is correct. I propose trial and error to find out.
+        // -1 definitely means no bound.
+        let new_width = match new_width.into() {
+            None => -1,
+            Some(x) if x == f64::INFINITY => -1,
+            Some(x) => pango::units_from_double(x),
+            // TODO should negative width be an error? In this impl it will probably mean the same
+            // as `None`.
+        };
+        self.layout.set_width(new_width);
         Ok(())
     }
 
     fn line_text(&self, line_number: usize) -> Option<&str> {
-        self.line_metrics
-            .get(line_number)
-            .map(|lm| &self.text[lm.range()])
+        // I can't figure out if this is possible using LayoutLine (I don't think it is), so I'm
+        // using `LayoutIter`.
+        let mut iter = self.iter_at_line_number(line_number)?;
+        // We can now get the byte indexes for the line. This could be eagerly calculated or cached
+        // if desired.
+        let (start, end) = self.iter_line_text(&mut iter);
+        Some(&self.text[start..end])
     }
 
     fn line_metric(&self, line_number: usize) -> Option<LineMetric> {
-        if line_number == 0 && self.text.is_empty() {
-            Some(LineMetric {
-                baseline: self.font.extents().ascent,
-                height: self.font.extents().height,
-                ..Default::default()
-            })
-        } else {
-            self.line_metrics.get(line_number).cloned()
-        }
+        let mut iter = self.iter_at_line_number(line_number)?;
+        let (
+            _ink,
+            pango::Rectangle {
+                x: _,
+                y,
+                width: _,
+                height,
+            },
+        ) = iter.get_line_extents();
+        let (start, end) = self.iter_line_text(&mut iter);
+        let line_text = &self.text[start..end];
+        Some(LineMetric {
+            // Index into str - start of line
+            start_offset: start,
+            // Index into str - start of next line
+            end_offset: end,
+            // length of whitespace in code units (bytes for utf-8, which we are)
+            trailing_whitespace: count_trailing_whitespace(line_text),
+            // Distance from top of line to baseline. Usually positive.
+            baseline: pango::units_to_double(iter.get_baseline()),
+            // Distance from baseline to max descent.
+            height: pango::units_to_double(height),
+            // Distance of line from top of layout (y in layout-space)
+            y_offset: pango::units_to_double(y),
+        })
     }
 
     fn line_count(&self) -> usize {
-        self.line_metrics.len()
+        self.layout
+            .get_line_count()
+            .try_into()
+            .expect("PangoTextLayout::line_count: i32 -> usize conv failed")
     }
 
     fn hit_test_point(&self, point: Point) -> HitTestPoint {
-        // internal logic is using grapheme clusters, but return the text position associated
-        // with the border of the grapheme cluster.
-
-        // null case
-        if self.text.is_empty() {
-            return HitTestPoint::default();
-        }
-
-        let height = self
-            .line_metrics
-            .last()
-            .map(|lm| lm.y_offset + lm.height)
-            .unwrap_or(0.0);
-
-        // determine whether this click is within the y bounds of the layout,
-        // and what line it coorresponds to. (For points above and below the layout,
-        // we hittest the first and last lines respectively.)
-        let (y_inside, lm) = if point.y < 0. {
-            (false, self.line_metrics.first().unwrap())
-        } else if point.y >= height {
-            (false, self.line_metrics.last().unwrap())
-        } else {
-            let line = self
-                .line_metrics
-                .iter()
-                .find(|l| point.y >= l.y_offset && point.y < l.y_offset + l.height)
-                .unwrap();
-            (true, line)
-        };
-
-        // Trailing whitespace is remove for the line
-        let line = &self.text[lm.range()];
-
-        let mut htp = hit_test_line_point(&self.font, line, point);
-        htp.idx += lm.start_offset;
-        htp.is_inside &= y_inside;
+        // XXX is_inside is always false - pango hit testing does not test the glyph outline,
+        // only the bounding box.
+        // The first return value (bool) denotes whether the point is in text - this is *not* the
+        // same as `is_inside`.
+        // TODO again I don't know if `units_from_double` gives me what I want. I'm slowly
+        // convincing myself that it should, but I'm not in any way sure.
+        let x = pango::units_from_double(point.x);
+        let y = pango::units_from_double(point.y);
+        let (_, index, _) = self.layout.xy_to_index(x, y);
+        let mut htp = HitTestPoint::default();
+        htp.idx = index
+            .try_into()
+            .expect("PangoTextLayout::hit_text_point: i32 -> usize conv failed");
         htp
     }
 
     fn hit_test_text_position(&self, idx: usize) -> HitTestPosition {
-        let idx = idx.min(self.text.len());
-        assert!(self.text.is_char_boundary(idx));
-
-        if idx == 0 && self.text.is_empty() {
-            return HitTestPosition::new(Point::new(0., self.font.extents().ascent), 0);
-        }
-
-        // first need to find line it's on, and get line start offset
-        let line_num = util::line_number_for_position(&self.line_metrics, idx);
-        let lm = self.line_metrics.get(line_num).cloned().unwrap();
-
-        let y_pos = lm.y_offset + lm.baseline;
-
-        // Then for the line, do text position
-        // Trailing whitespace is removed for the line
-        let line = &self.text[lm.range()];
-        let line_position = idx - lm.start_offset;
-
-        let x_pos = hit_test_line_position(&self.font, line, line_position);
-        HitTestPosition::new(Point::new(x_pos, y_pos), line_num)
+        let idx: i32 = idx
+            .try_into()
+            .expect("PangoTextLayout::hit_test_text_position: usize -> i32 conv failed");
+        let (line, x_pos) = self.layout.index_to_line_x(idx, false);
+        let mut htp = HitTestPosition::default();
+        htp.line = line
+            .try_into()
+            .expect("PangoTextLayout::hit_test_text_position: i32 -> usize conv failed");
+        // TODO check conv.
+        htp.point.x = pango::units_to_double(x_pos);
+        // to get baseline y, we need to use the run iterator again.
+        let mut iter = self
+            .iter_at_line_number(htp.line)
+            .expect("pango reported text is on a line, but it also reports the line doesn't exist");
+        htp.point.y = pango::units_to_double(iter.get_baseline());
+        htp
     }
 }
 
-// NOTE this is the same as the old, non-line-aware version of hit_test_point
-// Future: instead of passing Font, should there be some other line-level text layout?
-fn hit_test_line_point(font: &ScaledFont, text: &str, point: Point) -> HitTestPoint {
-    // null case
-    if text.is_empty() {
-        return HitTestPoint::default();
-    }
-
-    // get bounds
-    // TODO handle if string is not null yet count is 0?
-    let end = UnicodeSegmentation::graphemes(text, true).count() - 1;
-    let end_bounds = match get_grapheme_boundaries(font, text, end) {
-        Some(bounds) => bounds,
-        None => return HitTestPoint::default(),
-    };
-
-    let start = 0;
-    let start_bounds = match get_grapheme_boundaries(font, text, start) {
-        Some(bounds) => bounds,
-        None => return HitTestPoint::default(),
-    };
-
-    // first test beyond ends
-    if point.x > end_bounds.trailing {
-        return HitTestPoint::new(text.len(), false);
-    }
-    if point.x <= start_bounds.leading {
-        return HitTestPoint::default();
-    }
-
-    // then test the beginning and end (common cases)
-    if let Some(hit) = point_x_in_grapheme(point.x, &start_bounds) {
-        return hit;
-    }
-    if let Some(hit) = point_x_in_grapheme(point.x, &end_bounds) {
-        return hit;
-    }
-
-    // Now that we know it's not beginning or end, begin binary search.
-    // Iterative style
-    let mut left = start;
-    let mut right = end;
-    loop {
-        // pick halfway point
-        let middle = left + ((right - left) / 2);
-
-        let grapheme_bounds = match get_grapheme_boundaries(font, text, middle) {
-            Some(bounds) => bounds,
-            None => return HitTestPoint::default(),
-        };
-
-        if let Some(hit) = point_x_in_grapheme(point.x, &grapheme_bounds) {
-            return hit;
-        }
-
-        // since it's not a hit, check if closer to start or finish
-        // and move the appropriate search boundary
-        if point.x < grapheme_bounds.leading {
-            right = middle;
-        } else if point.x > grapheme_bounds.trailing {
-            left = middle + 1;
-        } else {
-            unreachable!("hit_test_point conditional is exhaustive");
-        }
-    }
-}
-
-// NOTE this is the same as the old, non-line-aware version of hit_test_text_position.
-// Future: instead of passing Font, should there be some other line-level text layout?
-fn hit_test_line_position(font: &ScaledFont, text: &str, text_position: usize) -> f64 {
-    // Using substrings with unicode grapheme awareness
-
-    let text_len = text.len();
-
-    if text_position == 0 {
-        return 0.0;
-    }
-
-    if text_position as usize >= text_len {
-        return font.text_extents(&text).x_advance;
-    }
-
-    // Already checked that text_position > 0 and text_position < count.
-    // If text position is not at a grapheme boundary, use the text position of current
-    // grapheme cluster. But return the original text position
-    // Use the indices (byte offset, which for our purposes = utf8 code units).
-    let grapheme_indices = UnicodeSegmentation::grapheme_indices(text, true)
-        .take_while(|(byte_idx, _s)| text_position >= *byte_idx);
-
-    grapheme_indices
-        .last()
-        .map(|(idx, _)| font.text_extents(&text[..idx]).x_advance)
-        .unwrap_or_else(|| font.text_extents(&text).x_advance)
-}
-
-fn scale_matrix(scale: f64) -> Matrix {
-    Matrix {
-        xx: scale,
-        yx: 0.0,
-        xy: 0.0,
-        yy: scale,
-        x0: 0.0,
-        y0: 0.0,
-    }
+// TODO: is non-breaking space trailing whitespace? Check with dwrite and
+// coretext
+fn count_trailing_whitespace(line: &str) -> usize {
+    line.chars().rev().take_while(|c| c.is_whitespace()).count()
 }
 
 #[cfg(test)]
@@ -408,7 +345,7 @@ mod test {
     #[test]
     #[allow(clippy::float_cmp)]
     fn hit_test_empty_string() {
-        let layout = CairoText::new().new_text_layout("").build().unwrap();
+        let layout = PangoText::new().new_text_layout("").build().unwrap();
         let pt = layout.hit_test_point(Point::new(0.0, 0.0));
         assert_eq!(pt.idx, 0);
         let pos = layout.hit_test_text_position(0);
@@ -420,7 +357,7 @@ mod test {
 
     #[test]
     fn test_hit_test_text_position_basic() {
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
 
         let input = "piet text!";
 
@@ -476,7 +413,7 @@ mod test {
         let input = "é";
         assert_eq!(input.len(), 2);
 
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
         let layout = text_layout.new_text_layout(input).build().unwrap();
 
         assert_close!(layout.hit_test_text_position(0).point.x, 0.0, 3.0);
@@ -501,7 +438,7 @@ mod test {
         assert_eq!(input.len(), 7);
         assert_eq!(input.chars().count(), 3);
 
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
         let layout = text_layout.new_text_layout(input).build().unwrap();
 
         assert_close!(layout.hit_test_text_position(0).point.x, 0.0, 3.0);
@@ -522,7 +459,7 @@ mod test {
         let input = "é\u{0023}\u{FE0F}\u{20E3}1\u{1D407}"; // #️⃣,, 𝐇
         assert_eq!(input.len(), 14);
 
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
         let layout = text_layout.new_text_layout(input).build().unwrap();
 
         let test_layout_0 = text_layout.new_text_layout(&input[0..2]).build().unwrap();
@@ -569,7 +506,7 @@ mod test {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_hit_test_point_basic_0() {
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
 
         let layout = text_layout.new_text_layout("piet text!").build().unwrap();
         println!("text pos 4: {:?}", layout.hit_test_text_position(4)); // 23.0
@@ -609,7 +546,7 @@ mod test {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_hit_test_point_basic_0() {
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
 
         let layout = text_layout.new_text_layout("piet text!").build().unwrap();
         println!("text pos 4: {:?}", layout.hit_test_text_position(4)); // 19.34765625
@@ -648,7 +585,7 @@ mod test {
     #[cfg(target_os = "linux")]
     // for testing that 'middle' assignment in binary search is correct
     fn test_hit_test_point_basic_1() {
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
 
         // base condition, one grapheme
         let layout = text_layout.new_text_layout("t").build().unwrap();
@@ -676,7 +613,7 @@ mod test {
     #[cfg(target_os = "macos")]
     // for testing that 'middle' assignment in binary search is correct
     fn test_hit_test_point_basic_1() {
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
 
         // base condition, one grapheme
         let layout = text_layout.new_text_layout("t").build().unwrap();
@@ -710,7 +647,7 @@ mod test {
         // 4 graphemes
         let input = "é\u{0023}\u{FE0F}\u{20E3}1\u{1D407}"; // #️⃣,, 𝐇
 
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
         let layout = text_layout.new_text_layout(input).build().unwrap();
         //println!("text pos 2: {:?}", layout.hit_test_text_position(2)); // 6.99999999
         //println!("text pos 9: {:?}", layout.hit_test_text_position(9)); // 24.0
@@ -755,7 +692,7 @@ mod test {
         // 4 graphemes
         let input = "é\u{0023}\u{FE0F}\u{20E3}1\u{1D407}"; // #️⃣,, 𝐇
 
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
         let layout = text_layout.new_text_layout(input).build().unwrap();
         println!("text pos 2: {:?}", layout.hit_test_text_position(2)); // 6.673828125
         println!("text pos 9: {:?}", layout.hit_test_text_position(9)); // 28.55859375
@@ -801,7 +738,7 @@ mod test {
         // This corresponds to the char 'y' in the input.
         let input = "tßßypi";
 
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
         let layout = text_layout.new_text_layout(input).build().unwrap();
         println!("text pos 0: {:?}", layout.hit_test_text_position(0)); // 0.0
         println!("text pos 1: {:?}", layout.hit_test_text_position(1)); // 5.0
@@ -824,7 +761,7 @@ mod test {
         // This corresponds to the char 'y' in the input.
         let input = "tßßypi";
 
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
         let layout = text_layout.new_text_layout(input).build().unwrap();
         println!("text pos 0: {:?}", layout.hit_test_text_position(0)); // 0.0
         println!("text pos 1: {:?}", layout.hit_test_text_position(1)); // 5.0
@@ -841,7 +778,7 @@ mod test {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_multiline_hit_test_text_position_basic() {
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
 
         let input = "piet  text!";
 
@@ -897,7 +834,7 @@ mod test {
             .build()
             .unwrap();
 
-        println!("lm: {:#?}", full_layout.line_metrics);
+        //println!("lm: {:#?}", full_layout.line_metrics);
         println!("layout width: {:#?}", full_layout.size().width);
 
         println!("'pie': {}", pie_width);
@@ -990,7 +927,7 @@ mod test {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_multiline_hit_test_text_position_basic() {
-        let mut text_layout = CairoText::new();
+        let mut text_layout = PangoText::new();
 
         let input = "piet  text!";
         let font = text_layout
@@ -1156,7 +1093,7 @@ mod test {
     // very basic testing that multiline works
     fn test_multiline_hit_test_point_basic() {
         let input = "piet text most best";
-        let mut text = CairoText::new();
+        let mut text = PangoText::new();
 
         // this should break into four lines
         let layout = text.new_text_layout(input).max_width(30.0).build().unwrap();
@@ -1216,7 +1153,7 @@ mod test {
     // very basic testing that multiline works
     fn test_multiline_hit_test_point_basic() {
         let input = "piet text most best";
-        let mut text = CairoText::new();
+        let mut text = PangoText::new();
 
         let font = text.font_family("Helvetica").unwrap();
         // this should break into four lines

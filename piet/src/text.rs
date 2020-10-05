@@ -258,6 +258,24 @@ pub enum TextAlignment {
 
 /// A drawable text object.
 ///
+/// This is a key piece of the machinery necessary for rendering text: most (if not all) UI
+/// frameworks that handle text have this object in one form or another. The `TextLayout` object
+/// either owns or has access to both the text that will be rendered, and the ancilliary
+/// information required to draw to the screen. The 2 key pieces of information the layout needs
+/// besides text are: a way of *shaping* the text, which converts text to glyphs, and a way of
+/// rendering those glyphs onto the UI scene.
+///
+/// In simple ascii latin, there is a 1-1 correspondence between characters in the logical text
+/// string, and glyphs that will be drawn on the screen, but in general this isn't true. Two
+/// examples of when this isn't true are 1) emojis, where a single glyph consists of multiple
+/// characters (or even multiple grapheme clusters), and 2) cursive languages like Bengali, where
+/// the actual glyph used depends on the surrounding context as well as the characters themselves.
+/// The shaping step handles this conversion. It can also include deciding where to break text for
+/// multiline layouts, and how to align text within a line.
+///
+/// In addition, the text layout may provide methods for dealing with caret position, ellipsis,
+/// line breaking, and more.
+///
 /// ## Line Breaks
 ///
 /// A text layout may be broken into multiple lines in order to fit within a given width.
