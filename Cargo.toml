@@ -18,3 +18,7 @@ default-members = [
     "piet-web/examples/basic",
     "piet-svg"
 ]
+
+[patch.crates-io]
+font-kit = { path = "../font-kit" }
+cairo-rs = { path = "../cairo" }

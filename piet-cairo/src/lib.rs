@@ -20,7 +20,7 @@ pub struct CairoRenderContext<'a> {
     // Cairo has this as Clone and with &self methods, but we do this to avoid
     // concurrency problems.
     ctx: &'a Context,
-    text: CairoText,
+    text_ctx: CairoText,
     // because of the relationship between GTK and cairo (where GTK applies a transform
     // to adjust for menus and window borders) we cannot trust the transform returned
     // by cairo. Instead we maintain our own stack, which will contain
@@ -30,14 +30,10 @@ pub struct CairoRenderContext<'a> {
 
 impl<'a> CairoRenderContext<'a> {
     /// Create a new Cairo back-end.
-    ///
-    /// At the moment, it uses the "toy text API" for text layout, but when
-    /// we change to a more sophisticated text layout approach, we'll probably
-    /// need a factory for that as an additional argument.
-    pub fn new(ctx: &Context) -> CairoRenderContext {
+    pub fn new(ctx: &Context, text_ctx: CairoText) -> CairoRenderContext {
         CairoRenderContext {
             ctx,
-            text: CairoText::new(),
+            text_ctx,
             transform_stack: Vec::new(),
         }
     }
@@ -158,7 +154,7 @@ impl<'a> RenderContext for CairoRenderContext<'a> {
     }
 
     fn text(&mut self) -> &mut Self::Text {
-        &mut self.text
+        &mut self.text_ctx
     }
 
     fn draw_text(&mut self, layout: &Self::TextLayout, pos: impl Into<Point>) {
