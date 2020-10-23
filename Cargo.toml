@@ -19,3 +19,5 @@ default-members = [
     "piet-svg"
 ]
 
+[patch.crates-io]
+font-kit = { path = "../font-kit" }

@@ -14,7 +14,7 @@ piet = { version = "0.2.0-pre5", path = "../piet" }
 
 unicode-segmentation = "1.3.0"
 xi-unicode = "0.2.0"
-skribo = "0.1.1"
+skribo = { git = "https://github.com/linebender/skribo" }
 font-kit = "0.10.0"
 
 [dependencies.cairo-rs]

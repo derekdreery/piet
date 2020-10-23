@@ -3,6 +3,7 @@
 mod grapheme;
 mod lines;
 
+use std::cell::RefCell;
 use std::ops::RangeBounds;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -16,11 +17,13 @@ use piet::{
 };
 
 use font_kit::{
-    error::SelectionError,
+    error::{FontLoadingError, SelectionError},
     family_name::FamilyName as FkFamilyName,
+    handle::Handle,
     loaders::freetype::Font,
     properties::{Properties as FkProps, Style as FkStyle, Weight as FkFontWeight},
-    source::SystemSource,
+    source::{Source, SystemSource},
+    sources::{mem::MemSource, multi::MultiSource},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -35,13 +38,18 @@ const FT_KEY: UserDataKey<Font> = UserDataKey::new();
 #[derive(Clone)]
 pub struct CairoText {
     /// An object used to search for fonts on the system.
-    source: Arc<SystemSource>,
+    source: Rc<RefCell<MultiSource>>,
 }
 
 impl CairoText {
-    pub fn new(source: SystemSource) -> Self {
+    pub fn new() -> Self {
+        let mut sources = Vec::new();
+        sources.push(Box::new(SystemSource::new()) as Box<dyn Source + 'static>);
+        // empty iterator can't fail.
+        sources.push(Box::new(MemSource::from_fonts(std::iter::empty()).unwrap()));
+        let source = MultiSource::from_sources(sources);
         CairoText {
-            source: Arc::new(source),
+            source: Rc::new(RefCell::new(source)),
         }
     }
 }
@@ -68,7 +76,7 @@ pub struct CairoTextLayoutBuilder {
     text: Rc<dyn TextStorage>,
     defaults: util::LayoutDefaults,
     width_constraint: f64,
-    source: Arc<SystemSource>,
+    source: Rc<RefCell<MultiSource>>,
 }
 
 impl Text for CairoText {
@@ -76,7 +84,7 @@ impl Text for CairoText {
     type TextLayoutBuilder = CairoTextLayoutBuilder;
 
     fn font_family(&mut self, family_name: &str) -> Option<FontFamily> {
-        match self.source.select_family_by_name(family_name) {
+        match self.source.borrow().select_family_by_name(family_name) {
             Ok(_handle) => Some(FontFamily::new_unchecked(family_name)),
             Err(SelectionError::NotFound) => None,
             Err(e) => {
@@ -86,8 +94,22 @@ impl Text for CairoText {
         }
     }
 
-    fn load_font(&mut self, _data: &[u8]) -> Result<FontFamily, Error> {
-        Err(Error::NotSupported)
+    fn load_font(&mut self, data: &[u8]) -> Result<FontFamily, Error> {
+        fn load_inner(
+            source: &mut MemSource,
+            data: Arc<Vec<u8>>,
+        ) -> Result<String, FontLoadingError> {
+            let handle = Handle::from_memory(data, 0);
+            let name = handle.load()?.family_name();
+            source.add_font(handle)?;
+            Ok(name)
+        }
+        load_inner(
+            self.source.borrow_mut().find_first::<MemSource>().unwrap(),
+            Arc::new(data.to_owned()),
+        )
+        .map(FontFamily::new_unchecked)
+        .map_err(|_| Error::FontLoadingFailed)
     }
 
     fn new_text_layout(&mut self, text: impl TextStorage) -> Self::TextLayoutBuilder {
@@ -116,7 +138,7 @@ impl CairoFont {
         size: f64,
         style: FontStyle,
         weight: FontWeight,
-        source: Arc<SystemSource>,
+        source: &dyn Source,
     ) -> ScaledFont {
         let family_name = fk_family_name(&self.family);
         let ft_font_face = Rc::new(
@@ -174,7 +196,7 @@ impl TextLayoutBuilder for CairoTextLayoutBuilder {
             self.defaults.font_size,
             self.defaults.style,
             self.defaults.weight,
-            self.source,
+            &*self.source.borrow(),
         );
 
         // invalid until update_width() is called
