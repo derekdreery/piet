@@ -3,8 +3,6 @@
 mod grapheme;
 mod lines;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ops::RangeBounds;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -131,7 +129,7 @@ impl CairoFont {
         let font_face = unsafe {
             let face = FontFace::create_from_ft(ft_font_face.native_font());
             // make sure the freetype font hangs around for as long as the cairo font.
-            face.set_user_data(&FT_KEY, ft_font_face.clone());
+            face.set_user_data(&FT_KEY, ft_font_face);
             face
         };
         let font_matrix = scale_matrix(size);

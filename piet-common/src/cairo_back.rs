@@ -4,6 +4,7 @@
 //! Support for piet Cairo back-end.
 
 use cairo::{Context, Format, ImageSurface};
+use font_kit::sources::fontconfig::FontconfigSource;
 #[cfg(feature = "png")]
 use png::{ColorType, Encoder};
 #[cfg(feature = "png")]
@@ -96,7 +97,7 @@ impl<'a> BitmapTarget<'a> {
     /// Note: caller is responsible for calling `finish` on the render
     /// context at the end of rendering.
     pub fn render_context(&mut self) -> CairoRenderContext {
-        CairoRenderContext::new(&self.cr)
+        CairoRenderContext::new(&self.cr, CairoText::new(FontconfigSource::new()))
     }
 
     /// Get raw RGBA pixels from the bitmap by copying them into `buf`. If all the pixels were
@@ -122,27 +123,28 @@ impl<'a> BitmapTarget<'a> {
         self.surface
             .with_data(|data| {
                 // A sanity check for all the unsafe indexing that follows.
-                assert!(data.get(data_len - 1).is_some());
                 assert!(buf.get(size - 1).is_some());
 
-                for y in 0..height {
-                    let src_off = y * stride;
-                    let dst_off = y * width * 4;
-                    for x in 0..width {
-                        // These unchecked indexes allow the autovectorizer to shine.
-                        // Note that dst_off maxes out at (height - 1) * width * 4, and so
-                        // dst_off + x * 4 + 3 maxes out at height * width * 4 - 1, which is size - 1.
-                        // Also, src_off maxes out at (height - 1) * stride, and so
-                        // src_off + x * 4 + 3 maxes out at (height - 1) * stride + width * 4 - 1,
-                        // which is data_len - 1.
-                        *buf.get_unchecked_mut(dst_off + x * 4 + 0) =
-                            *data.get_unchecked(src_off + x * 4 + 2);
-                        *buf.get_unchecked_mut(dst_off + x * 4 + 1) =
-                            *data.get_unchecked(src_off + x * 4 + 1);
-                        *buf.get_unchecked_mut(dst_off + x * 4 + 2) =
-                            *data.get_unchecked(src_off + x * 4 + 0);
-                        *buf.get_unchecked_mut(dst_off + x * 4 + 3) =
-                            *data.get_unchecked(src_off + x * 4 + 3);
+                unsafe {
+                    for y in 0..height {
+                        let src_off = y * stride;
+                        let dst_off = y * width * 4;
+                        for x in 0..width {
+                            // These unchecked indexes allow the autovectorizer to shine.
+                            // Note that dst_off maxes out at (height - 1) * width * 4, and so
+                            // dst_off + x * 4 + 3 maxes out at height * width * 4 - 1, which is size - 1.
+                            // Also, src_off maxes out at (height - 1) * stride, and so
+                            // src_off + x * 4 + 3 maxes out at (height - 1) * stride + width * 4 - 1,
+                            // which is data_len - 1.
+                            *buf.get_unchecked_mut(dst_off + x * 4 + 0) =
+                                *data.get_unchecked(src_off + x * 4 + 2);
+                            *buf.get_unchecked_mut(dst_off + x * 4 + 1) =
+                                *data.get_unchecked(src_off + x * 4 + 1);
+                            *buf.get_unchecked_mut(dst_off + x * 4 + 2) =
+                                *data.get_unchecked(src_off + x * 4 + 0);
+                            *buf.get_unchecked_mut(dst_off + x * 4 + 3) =
+                                *data.get_unchecked(src_off + x * 4 + 3);
+                        }
                     }
                 }
             })
