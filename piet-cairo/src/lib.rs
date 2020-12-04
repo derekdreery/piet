@@ -4,10 +4,13 @@
 
 mod text;
 
-use std::{borrow::Cow, marker::PhantomData, rc::Rc};
+use std::{borrow::Cow, cell::RefCell, marker::PhantomData, rc::Rc};
 
 use cairo::{Context, Filter, Format, ImageSurface, Matrix, SurfacePattern};
-use font_kit::source::Source as FkSource;
+use font_kit::{
+    source::SystemSource,
+    sources::{mem::MemSource, multi::MultiSource},
+};
 
 use piet::kurbo::{Affine, PathEl, Point, QuadBez, Rect, Shape, Size};
 use piet::{
@@ -15,14 +18,13 @@ use piet::{
     RenderContext, StrokeStyle, TextLayout,
 };
 
+use crate::text::to_cairo_glyphs;
 pub use crate::text::{CairoText, CairoTextLayout, CairoTextLayoutBuilder};
 
 pub struct CairoRenderContext<'a> {
     // Cairo has this as Clone and with &self methods, but we do this to avoid
     // concurrency problems.
     ctx: Rc<Context>,
-    // A fontconfig handle
-    fk_source: Rc<dyn FkSource>,
     // Necessary because we need to return a reference to it
     text: CairoText<'a>,
     // because of the relationship between GTK and cairo (where GTK applies a transform
@@ -39,15 +41,22 @@ impl<'a> CairoRenderContext<'a> {
     /// At the moment, it uses the "toy text API" for text layout, but when
     /// we change to a more sophisticated text layout approach, we'll probably
     /// need a factory for that as an additional argument.
-    pub fn new(ctx: Rc<Context>, fk_source: Rc<dyn FkSource>) -> CairoRenderContext<'a> {
+    pub fn new(ctx: Rc<Context>, fk_source: Rc<RefCell<MultiSource>>) -> CairoRenderContext<'a> {
         let text = CairoText::new(&ctx, &fk_source);
         CairoRenderContext {
             ctx,
-            fk_source,
             text,
             transform_stack: Vec::new(),
             phantom: PhantomData,
         }
+    }
+
+    pub fn with_default_font_source(ctx: Rc<Context>) -> Self {
+        let source = MultiSource::from_sources(vec![
+            Box::new(SystemSource::new()),
+            Box::new(MemSource::empty()),
+        ]);
+        Self::new(ctx, Rc::new(RefCell::new(source)))
     }
 }
 
@@ -177,8 +186,13 @@ impl<'a> RenderContext for CairoRenderContext<'a> {
         self.set_brush(&*brush);
 
         for lm in &layout.line_metrics {
+            println!("({},{})", pos.x, pos.y + lm.y_offset + lm.baseline);
             self.ctx.move_to(pos.x, pos.y + lm.y_offset + lm.baseline);
-            self.ctx.show_text(&layout.text[lm.range()]);
+            for run in layout.skribo_session.borrow_mut().iter_substr(lm.range()) {
+                // TODO we don't even check we're using the right font, but since we only added 1
+                // to the font collection we should be using it.
+                self.ctx.show_glyphs(&to_cairo_glyphs(&run))
+            }
         }
     }
 

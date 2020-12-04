@@ -13,7 +13,6 @@ use std::io::BufWriter;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::rc::Rc;
-use font_kit::source::SystemSource;
 
 use piet::{ImageBuf, ImageFormat};
 #[doc(hidden)]
@@ -98,7 +97,7 @@ impl<'a> BitmapTarget<'a> {
     /// Note: caller is responsible for calling `finish` on the render
     /// context at the end of rendering.
     pub fn render_context(&mut self) -> CairoRenderContext<'a> {
-        CairoRenderContext::new(self.cr.clone(), Rc::new(SystemSource::new()))
+        CairoRenderContext::with_default_font_source(self.cr.clone())
     }
 
     /// Get raw RGBA pixels from the bitmap by copying them into `buf`. If all the pixels were

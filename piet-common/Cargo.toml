@@ -39,7 +39,6 @@ png = { version = "0.16.1", optional = true }
 [target.'cfg(target_os="linux")'.dependencies]
 piet-cairo = { version = "0.2.0", path = "../piet-cairo" }
 cairo-rs = { git = "https://github.com/gtk-rs/gtk-rs", rev = "82017a5", default-features = false }
-font-kit = { git = "https://github.com/servo/font-kit", rev = "6cbe87e" }
 
 [target.'cfg(target_os="macos")'.dependencies]
 piet-coregraphics = { version = "0.2.0", path = "../piet-coregraphics" }

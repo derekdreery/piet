@@ -3,18 +3,30 @@
 mod grapheme;
 mod lines;
 
+use std::cell::RefCell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use cairo::{FontFace, FontOptions, FontSlant, FontWeight, Matrix, ScaledFont};
+use cairo::{FontFace, FontOptions, Glyph, Matrix, ScaledFont};
+#[cfg(test)]
 use font_kit::source::Source as FkSource;
+use font_kit::{
+    family_name::FamilyName as FkFamilyName,
+    handle::Handle as FkHandle,
+    properties::{
+        Properties as FkProperties, Stretch as FkStretch, Style as FkStyle, Weight as FkWeight,
+    },
+    sources::{mem::MemSource, multi::MultiSource},
+};
+use skribo::LayoutSession;
 
 use piet::kurbo::{Point, Rect, Size};
 use piet::{
-    util, Color, Error, FontFamily, FontStyle, HitTestPoint, HitTestPosition, LineMetric, Text,
-    TextAttribute, TextLayout, TextLayoutBuilder, TextStorage,
+    util, Color, Error, FontFamily, FontStyle, FontWeight, HitTestPoint, HitTestPosition,
+    LineMetric, Text, TextAttribute, TextLayout, TextLayoutBuilder, TextStorage,
 };
 
 use unicode_segmentation::UnicodeSegmentation;
@@ -27,19 +39,9 @@ pub struct CairoText<'a> {
     // Use the repr(transparent)/transmute trick to allow us to return a ref to this object and
     // then lose it from the
     pub(crate) ctx: Rc<cairo::Context>,
-    pub(crate) fk_source: Rc<dyn FkSource>,
+    pub(crate) fk_source: Rc<RefCell<MultiSource>>,
     // Artificialy constrain the lifetime.
     phantom: PhantomData<&'a ()>,
-}
-
-impl<'a> CairoText<'a> {
-    pub(crate) fn new(ctx: &Rc<cairo::Context>, fk_source: &Rc<dyn FkSource>) -> Self {
-        Self {
-            ctx: (*ctx).clone(),
-            fk_source: (*fk_source).clone(),
-            phantom: PhantomData,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -56,6 +58,7 @@ pub struct CairoTextLayout {
     trailing_ws_width: f64,
     pub(crate) font: ScaledFont,
     pub(crate) text: Rc<dyn TextStorage>,
+    pub(crate) skribo_session: Rc<RefCell<LayoutSession<String>>>,
 
     // currently calculated on build
     pub(crate) line_metrics: Vec<LineMetric>,
@@ -65,6 +68,17 @@ pub struct CairoTextLayoutBuilder {
     text: Rc<dyn TextStorage>,
     defaults: util::LayoutDefaults,
     width_constraint: f64,
+    fk_source: Rc<RefCell<MultiSource>>,
+}
+
+impl<'a> CairoText<'a> {
+    pub(crate) fn new(ctx: &Rc<cairo::Context>, fk_source: &Rc<RefCell<MultiSource>>) -> Self {
+        Self {
+            ctx: (*ctx).clone(),
+            fk_source: (*fk_source).clone(),
+            phantom: PhantomData,
+        }
+    }
 }
 
 impl<'a> Text for CairoText<'a> {
@@ -72,15 +86,26 @@ impl<'a> Text for CairoText<'a> {
     type TextLayoutBuilder = CairoTextLayoutBuilder;
 
     fn font_family(&mut self, family_name: &str) -> Option<FontFamily> {
+        // font-kit resolves fonts rather than font families.
         Some(FontFamily::new_unchecked(family_name))
     }
 
-    fn load_font(&mut self, _data: &[u8]) -> Result<FontFamily, Error> {
-        log::error!(
-            "it's currently not possible to dynamically load fonts on the cairo backend. \
-            (see https://github.com/servo/font-kit/pull/170)"
-        );
-        Err(Error::NotSupported)
+    fn load_font(&mut self, data: &[u8]) -> Result<FontFamily, Error> {
+        // If the user added a `MemSource` to the font kit `MultiSource`, then we have somewhere to
+        // put the font.
+        match self.fk_source.borrow_mut().find_source_mut::<MemSource>() {
+            Some(source) => {
+                let handle = FkHandle::Memory {
+                    bytes: Arc::new(data.to_vec()),
+                    font_index: 0,
+                };
+                let font = source
+                    .add_font(handle)
+                    .map_err(|_| Error::FontLoadingFailed)?;
+                Ok(FontFamily::new_unchecked(font.family_name()))
+            }
+            None => Err(Error::NotSupported),
+        }
     }
 
     fn new_text_layout(&mut self, text: impl TextStorage) -> Self::TextLayoutBuilder {
@@ -88,6 +113,7 @@ impl<'a> Text for CairoText<'a> {
             defaults: util::LayoutDefaults::default(),
             text: Rc::new(text),
             width_constraint: f64::INFINITY,
+            fk_source: self.fk_source.clone(),
         }
     }
 }
@@ -108,9 +134,22 @@ impl CairoFont {
         self.resolve(size, FontSlant::Normal, FontWeight::Normal)
     }
 
+    #[cfg(test)]
     /// Create a ScaledFont for this family.
-    pub(crate) fn resolve(&self, size: f64, slant: FontSlant, weight: FontWeight) -> ScaledFont {
-        let font_face = FontFace::toy_create(self.family.name(), slant, weight);
+    pub(crate) fn resolve(
+        &self,
+        size: f64,
+        style: FontStyle,
+        weight: FontWeight,
+        source: &impl FkSource,
+    ) -> ScaledFont {
+        let ft_font = source
+            .select_best_match(&[fk_family_name(&self.family)], &fk_mk_props(style, weight))
+            .expect("todo handle errors")
+            .load()
+            .expect("todo handle errors");
+        // Safety: font-kit guarantees that our FtFace is valid.
+        let font_face = unsafe { FontFace::create_from_ft(ft_font.native_font()) };
         let font_matrix = scale_matrix(size);
         let ctm = scale_matrix(1.0);
         let options = FontOptions::default();
@@ -151,20 +190,35 @@ impl TextLayoutBuilder for CairoTextLayoutBuilder {
     }
 
     fn build(self) -> Result<Self::Out, Error> {
+        use skribo::{FontCollection, FontFamily};
         // set our default font
         let font = CairoFont::new(self.defaults.font.clone());
         let size = self.defaults.font_size;
-        let weight = if self.defaults.weight.to_raw() <= piet::FontWeight::MEDIUM.to_raw() {
-            FontWeight::Normal
-        } else {
-            FontWeight::Bold
-        };
-        let slant = match self.defaults.style {
-            FontStyle::Italic => FontSlant::Italic,
-            FontStyle::Regular => FontSlant::Normal,
-        };
-
-        let scaled_font = font.resolve(size, slant, weight);
+        let ft_font = self
+            .fk_source
+            .borrow()
+            .select_best_match(
+                &[fk_family_name(&font.family)],
+                &fk_mk_props(self.defaults.style, self.defaults.weight),
+            )
+            .expect("todo handle errors")
+            .load()
+            .expect("todo handle errors");
+        // Safety: font-kit guarantees that our FtFace is valid.
+        // Transfers ownership of the FtFace to cairo
+        let font_face = unsafe { FontFace::create_from_ft(ft_font.native_font()) };
+        let font_matrix = scale_matrix(size);
+        let ctm = scale_matrix(1.0);
+        let options = FontOptions::default();
+        let scaled_font = ScaledFont::new(&font_face, &font_matrix, &ctm, &options);
+        let sk_font = FontFamily::new_from_font(ft_font);
+        let mut font_collection = FontCollection::new();
+        font_collection.add_family(sk_font);
+        let skribo_session = Rc::new(RefCell::new(LayoutSession::create(
+            self.text.as_str().to_string(),
+            &skribo::TextStyle { size: 12. },
+            &font_collection,
+        )));
 
         // invalid until update_width() is called
         let mut layout = CairoTextLayout {
@@ -173,6 +227,7 @@ impl TextLayoutBuilder for CairoTextLayoutBuilder {
             size: Size::ZERO,
             trailing_ws_width: 0.0,
             line_metrics: Vec::new(),
+            skribo_session,
             text: self.text,
         };
 
@@ -341,7 +396,14 @@ impl CairoTextLayout {
 
 impl fmt::Debug for CairoTextLayout {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("CairoTextLayout").finish()
+        f.debug_struct("CairoTextLayout")
+            .field("fg_color", &self.fg_color)
+            .field("size", &self.size)
+            .field("trailing_ws_width", &self.trailing_ws_width)
+            .field("font", &"_")
+            .field("text", &self.text.as_str())
+            .field("line_metrics", &self.line_metrics)
+            .finish()
     }
 }
 
@@ -451,7 +513,43 @@ fn scale_matrix(scale: f64) -> Matrix {
     }
 }
 
-/*
+/// Make a font-kit `Properties` from our font variant types.
+fn fk_mk_props(slant: FontStyle, weight: FontWeight) -> FkProperties {
+    FkProperties {
+        style: match slant {
+            FontStyle::Regular => FkStyle::Normal,
+            FontStyle::Italic => FkStyle::Italic,
+        },
+        weight: FkWeight(weight.to_raw() as f32),
+        stretch: FkStretch::NORMAL,
+    }
+}
+
+/// Convert from a piet FontFamily to a fontkit FamilyName
+fn fk_family_name(font: &FontFamily) -> FkFamilyName {
+    match font {
+        &FontFamily::SANS_SERIF => FkFamilyName::SansSerif,
+        &FontFamily::SERIF => FkFamilyName::Serif,
+        // font-kit doesn't yet have system_ui
+        &FontFamily::SYSTEM_UI => FkFamilyName::SansSerif,
+        &FontFamily::MONOSPACE => FkFamilyName::Monospace,
+        other => FkFamilyName::Title(other.name().to_string()),
+    }
+}
+
+pub(crate) fn to_cairo_glyphs(run: &skribo::LayoutRun) -> Vec<Glyph> {
+    run.glyphs()
+        .map(|glyph| {
+            println!("{:?}", glyph);
+            Glyph {
+                index: glyph.glyph_id.into(),
+                x: glyph.offset.x() as f64,
+                y: glyph.offset.y() as f64,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -997,7 +1095,8 @@ mod test {
             full_layout.hit_test_text_position(9).point.x,
             tex_width,
             3.0,
-        );https://github.com/servo/font-kit/pull/170
+        );
+        https://github.com/servo/font-kit/pull/170
         assert_close!(full_layout.hit_test_text_position(8).point.x, te_width, 3.0,);
         assert_close!(full_layout.hit_test_text_position(7).point.x, t_width, 3.0,);
         // This should be beginning of second line
@@ -1343,4 +1442,3 @@ mod test {
         assert_eq!(pt.is_inside, false);
     }
 }
-*/
