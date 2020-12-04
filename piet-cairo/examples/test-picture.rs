@@ -2,9 +2,11 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::rc::Rc;
 
 use cairo::{Context, Format, ImageSurface};
 
+use font_kit::source::{Source, SystemSource};
 use piet::{samples, RenderContext};
 use piet_cairo::CairoRenderContext;
 
@@ -26,7 +28,7 @@ fn run_sample(idx: usize, base_dir: &Path) -> Result<(), Box<dyn std::error::Err
         .expect("Can't create surface");
     let cr = Context::new(&surface);
     cr.scale(HIDPI, HIDPI);
-    let mut piet_context = CairoRenderContext::new(&cr);
+    let mut piet_context = CairoRenderContext::new(Rc::new(cr), mk_font_source());
     sample.draw(&mut piet_context)?;
     piet_context.finish()?;
     surface.flush();
@@ -34,4 +36,8 @@ fn run_sample(idx: usize, base_dir: &Path) -> Result<(), Box<dyn std::error::Err
     let mut file = File::create(path)?;
 
     surface.write_to_png(&mut file).map_err(Into::into)
+}
+
+fn mk_font_source() -> Rc<dyn Source> {
+    Rc::new(SystemSource::new())
 }

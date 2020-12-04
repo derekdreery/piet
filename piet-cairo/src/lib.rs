@@ -4,9 +4,10 @@
 
 mod text;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, marker::PhantomData, rc::Rc};
 
 use cairo::{Context, Filter, Format, ImageSurface, Matrix, SurfacePattern};
+use font_kit::source::Source as FkSource;
 
 use piet::kurbo::{Affine, PathEl, Point, QuadBez, Rect, Shape, Size};
 use piet::{
@@ -19,13 +20,17 @@ pub use crate::text::{CairoText, CairoTextLayout, CairoTextLayoutBuilder};
 pub struct CairoRenderContext<'a> {
     // Cairo has this as Clone and with &self methods, but we do this to avoid
     // concurrency problems.
-    ctx: &'a Context,
-    text: CairoText,
+    ctx: Rc<Context>,
+    // A fontconfig handle
+    fk_source: Rc<dyn FkSource>,
+    // Necessary because we need to return a reference to it
+    text: CairoText<'a>,
     // because of the relationship between GTK and cairo (where GTK applies a transform
     // to adjust for menus and window borders) we cannot trust the transform returned
     // by cairo. Instead we maintain our own stack, which will contain
     // only those transforms applied by us.
     transform_stack: Vec<Affine>,
+    phantom: PhantomData<&'a ()>,
 }
 
 impl<'a> CairoRenderContext<'a> {
@@ -34,11 +39,14 @@ impl<'a> CairoRenderContext<'a> {
     /// At the moment, it uses the "toy text API" for text layout, but when
     /// we change to a more sophisticated text layout approach, we'll probably
     /// need a factory for that as an additional argument.
-    pub fn new(ctx: &Context) -> CairoRenderContext {
+    pub fn new(ctx: Rc<Context>, fk_source: Rc<dyn FkSource>) -> CairoRenderContext<'a> {
+        let text = CairoText::new(&ctx, &fk_source);
         CairoRenderContext {
             ctx,
-            text: CairoText::new(),
+            fk_source,
+            text,
             transform_stack: Vec::new(),
+            phantom: PhantomData,
         }
     }
 }
@@ -70,7 +78,7 @@ macro_rules! set_gradient_stops {
 impl<'a> RenderContext for CairoRenderContext<'a> {
     type Brush = Brush;
 
-    type Text = CairoText;
+    type Text = CairoText<'a>;
     type TextLayout = CairoTextLayout;
 
     type Image = ImageSurface;
@@ -305,9 +313,9 @@ impl<'a> RenderContext for CairoRenderContext<'a> {
     }
 }
 
-fn draw_image<'a>(
-    ctx: &mut CairoRenderContext<'a>,
-    image: &<CairoRenderContext<'a> as RenderContext>::Image,
+fn draw_image(
+    ctx: &mut CairoRenderContext,
+    image: &<CairoRenderContext as RenderContext>::Image,
     src_rect: Option<Rect>,
     dst_rect: Rect,
     interp: InterpolationMode,

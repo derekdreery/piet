@@ -12,6 +12,8 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::rc::Rc;
+use font_kit::source::SystemSource;
 
 use piet::{ImageBuf, ImageFormat};
 #[doc(hidden)]
@@ -28,7 +30,7 @@ pub type Brush = piet_cairo::Brush;
 /// The associated text factory for this backend.
 ///
 /// This type matches `RenderContext::Text`
-pub type PietText = CairoText;
+pub type PietText<'a> = CairoText<'a>;
 
 /// The associated text layout type for this backend.
 ///
@@ -59,7 +61,7 @@ unsafe impl Send for Device {}
 /// A struct provides a `RenderContext` and then can have its bitmap extracted.
 pub struct BitmapTarget<'a> {
     surface: ImageSurface,
-    cr: Context,
+    cr: Rc<Context>,
     phantom: PhantomData<&'a ()>,
 }
 
@@ -84,7 +86,7 @@ impl Device {
         let phantom = Default::default();
         Ok(BitmapTarget {
             surface,
-            cr,
+            cr: Rc::new(cr),
             phantom,
         })
     }
@@ -95,8 +97,8 @@ impl<'a> BitmapTarget<'a> {
     ///
     /// Note: caller is responsible for calling `finish` on the render
     /// context at the end of rendering.
-    pub fn render_context(&mut self) -> CairoRenderContext {
-        CairoRenderContext::new(&self.cr)
+    pub fn render_context(&mut self) -> CairoRenderContext<'a> {
+        CairoRenderContext::new(self.cr.clone(), Rc::new(SystemSource::new()))
     }
 
     /// Get raw RGBA pixels from the bitmap by copying them into `buf`. If all the pixels were
@@ -130,7 +132,7 @@ impl<'a> BitmapTarget<'a> {
             // https://github.com/gtk-rs/cairo/pull/330
             let data_len = height.saturating_sub(1) * stride + width * 4;
             let data = {
-                let data_ptr = cairo_sys::cairo_image_surface_get_data(self.surface.to_raw_none());
+                let data_ptr = cairo::ffi::cairo_image_surface_get_data(self.surface.to_raw_none());
                 assert!(!data_ptr.is_null(), "surface is finished");
                 std::slice::from_raw_parts(data_ptr, data_len)
             };
