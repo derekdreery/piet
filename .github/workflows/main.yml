@@ -2,6 +2,7 @@ on:
   push:
     branches:
       - master
+      - fix_image_panic
   pull_request:
 
 jobs:
