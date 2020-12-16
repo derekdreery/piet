@@ -24,7 +24,7 @@ fn empty_image_should_not_panic() {
                 image.format(),
             )
             .map_err(|e| e.to_string())?;
-        return;
+        return Ok(());
         ctx.draw_image(
             &image,
             Rect::new(0., 0., 400., 400.),
@@ -39,7 +39,7 @@ fn empty_image_dest_should_not_panic() {
     let image = ImageBuf::from_raw(&[0, 0, 0, 0][..], ImageFormat::RgbaSeparate, 1, 1);
     with_context(|ctx| {
         let image = image.to_image(ctx);
-        return;
+        return Ok(());
         ctx.draw_image(
             &image,
             Rect::new(0., 0., 0., 0.),
@@ -54,7 +54,7 @@ fn empty_image_area_should_not_panic() {
     let image = ImageBuf::from_raw(&[0, 0, 0, 0][..], ImageFormat::RgbaSeparate, 1, 1);
     with_context(|ctx| {
         let image = image.to_image(ctx);
-        return;
+        return Ok(());
         ctx.draw_image_area(
             &image,
             Rect::new(0., 0., 0., 0.),
