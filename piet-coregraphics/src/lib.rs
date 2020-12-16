@@ -288,6 +288,19 @@ impl<'a> RenderContext for CoreGraphicsContext<'a> {
         // this doesn't matter, we set interpolation mode manually in draw_image
         let should_interpolate = false;
         let rendering_intent = kCGRenderingIntentDefault;
+        panic!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+            width,
+            height,
+            bits_per_component,
+            bytes * bits_per_component,
+            width * bytes,
+            colorspace,
+            bitmap_info,
+            data_provider,
+            should_interpolate,
+            rendering_intent
+        );
         let image = CGImage::new(
             width,
             height,
